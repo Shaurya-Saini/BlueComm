@@ -50,9 +50,16 @@ class _DeviceDiscoveryScreenState extends State<DeviceDiscoveryScreen> {
     // and sets up platform channel listeners.
     _connectionManager.initialize();
 
-    // Handle incoming connections from the server socket.
-    // When another device connects to us, automatically navigate to chat.
-    _connectionManager.onIncomingConnection = () {
+    // Handle incoming connection requests from the server socket.
+    // Show an approval dialog instead of auto-navigating to chat.
+    _connectionManager.onConnectionRequest = (name, address) {
+      if (mounted) {
+        _showConnectionRequestDialog(name, address);
+      }
+    };
+
+    // Navigate to chat after the user accepts the incoming connection.
+    _connectionManager.onConnectionAccepted = () {
       if (mounted) {
         _navigateToChat();
       }
@@ -235,6 +242,8 @@ class _DeviceDiscoveryScreenState extends State<DeviceDiscoveryScreen> {
       case BtConnectionState.connecting:
       case BtConnectionState.reconnecting:
         return Colors.amber;
+      case BtConnectionState.pendingRequest:
+        return Colors.orange;
       case BtConnectionState.connected:
         return Colors.green;
     }
@@ -249,6 +258,8 @@ class _DeviceDiscoveryScreenState extends State<DeviceDiscoveryScreen> {
         return 'Scanning';
       case BtConnectionState.connecting:
         return 'Connecting';
+      case BtConnectionState.pendingRequest:
+        return 'Request';
       case BtConnectionState.connected:
         return 'Connected';
       case BtConnectionState.reconnecting:
@@ -256,6 +267,69 @@ class _DeviceDiscoveryScreenState extends State<DeviceDiscoveryScreen> {
       case BtConnectionState.disconnected:
         return 'Disconnected';
     }
+  }
+
+  // Shows a dialog asking the user to accept or decline an incoming
+  // Bluetooth connection request.
+  void _showConnectionRequestDialog(String name, String address) {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) {
+        return AlertDialog(
+          icon: const Icon(Icons.bluetooth, size: 36, color: Colors.blueAccent),
+          title: const Text('Incoming Connection'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                '$name',
+                style: const TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                address,
+                style: TextStyle(fontSize: 13, color: Colors.grey[400]),
+              ),
+              const SizedBox(height: 12),
+              const Text(
+                'wants to connect with you.',
+                textAlign: TextAlign.center,
+              ),
+            ],
+          ),
+          actionsAlignment: MainAxisAlignment.spaceEvenly,
+          actions: [
+            TextButton.icon(
+              onPressed: () {
+                Navigator.of(dialogContext).pop();
+                _connectionManager.declineConnection();
+                _showSnackBar('Connection declined.');
+              },
+              icon: const Icon(Icons.close, color: Colors.redAccent),
+              label: const Text(
+                'Decline',
+                style: TextStyle(color: Colors.redAccent),
+              ),
+            ),
+            FilledButton.icon(
+              onPressed: () {
+                Navigator.of(dialogContext).pop();
+                _connectionManager.acceptConnection();
+              },
+              icon: const Icon(Icons.check),
+              label: const Text('Accept'),
+              style: FilledButton.styleFrom(
+                backgroundColor: Colors.green,
+              ),
+            ),
+          ],
+        );
+      },
+    );
   }
 
   @override
