@@ -40,6 +40,10 @@ class _DeviceDiscoveryScreenState extends State<DeviceDiscoveryScreen> {
   // Current connection state for the status chip display.
   BtConnectionState _connectionState = BtConnectionState.idle;
 
+  // True when an incoming connection is waiting for user approval via dialog.
+  // Prevents the stateStream listener from auto-navigating to chat.
+  bool _pendingIncomingApproval = false;
+
   @override
   void initState() {
     super.initState();
@@ -50,18 +54,16 @@ class _DeviceDiscoveryScreenState extends State<DeviceDiscoveryScreen> {
     // and sets up platform channel listeners.
     _connectionManager.initialize();
 
-    // Handle incoming connection requests from the server socket.
-    // Show an approval dialog instead of auto-navigating to chat.
-    _connectionManager.onConnectionRequest = (name, address) {
+    // Handle incoming connections from the server socket.
+    // Instead of auto-navigating to chat, show an approval dialog.
+    _connectionManager.onIncomingConnection = () {
       if (mounted) {
-        _showConnectionRequestDialog(name, address);
-      }
-    };
-
-    // Navigate to chat after the user accepts the incoming connection.
-    _connectionManager.onConnectionAccepted = () {
-      if (mounted) {
-        _navigateToChat();
+        _pendingIncomingApproval = true;
+        final device = _connectionManager.connectedDevice;
+        _showConnectionRequestDialog(
+          device?.name ?? 'Unknown Device',
+          device?.address ?? '',
+        );
       }
     };
 
@@ -72,8 +74,9 @@ class _DeviceDiscoveryScreenState extends State<DeviceDiscoveryScreen> {
           _connectionState = state;
         });
 
-        // Navigate to Chat Screen when connection is established (client-side).
-        if (state == BtConnectionState.connected) {
+        // Navigate to Chat Screen when connection is established (client-side only).
+        // For incoming connections, navigation is gated behind the approval dialog.
+        if (state == BtConnectionState.connected && !_pendingIncomingApproval) {
           _navigateToChat();
         }
       }
@@ -208,8 +211,9 @@ class _DeviceDiscoveryScreenState extends State<DeviceDiscoveryScreen> {
         ),
       ),
     ).then((_) {
-      // When returning from Chat Screen, reload paired devices.
+      // When returning from Chat Screen, reload paired devices and reset flags.
       if (mounted) {
+        _pendingIncomingApproval = false;
         _loadPairedDevices();
         setState(() {
           _connectionState = _connectionManager.currentState;
@@ -242,8 +246,6 @@ class _DeviceDiscoveryScreenState extends State<DeviceDiscoveryScreen> {
       case BtConnectionState.connecting:
       case BtConnectionState.reconnecting:
         return Colors.amber;
-      case BtConnectionState.pendingRequest:
-        return Colors.orange;
       case BtConnectionState.connected:
         return Colors.green;
     }
@@ -258,8 +260,6 @@ class _DeviceDiscoveryScreenState extends State<DeviceDiscoveryScreen> {
         return 'Scanning';
       case BtConnectionState.connecting:
         return 'Connecting';
-      case BtConnectionState.pendingRequest:
-        return 'Request';
       case BtConnectionState.connected:
         return 'Connected';
       case BtConnectionState.reconnecting:
@@ -283,7 +283,7 @@ class _DeviceDiscoveryScreenState extends State<DeviceDiscoveryScreen> {
             mainAxisSize: MainAxisSize.min,
             children: [
               Text(
-                '$name',
+                name,
                 style: const TextStyle(
                   fontSize: 18,
                   fontWeight: FontWeight.bold,
@@ -306,7 +306,9 @@ class _DeviceDiscoveryScreenState extends State<DeviceDiscoveryScreen> {
             TextButton.icon(
               onPressed: () {
                 Navigator.of(dialogContext).pop();
-                _connectionManager.declineConnection();
+                _pendingIncomingApproval = false;
+                // Decline: disconnect the already-accepted socket.
+                _connectionManager.disconnect();
                 _showSnackBar('Connection declined.');
               },
               icon: const Icon(Icons.close, color: Colors.redAccent),
@@ -318,7 +320,9 @@ class _DeviceDiscoveryScreenState extends State<DeviceDiscoveryScreen> {
             FilledButton.icon(
               onPressed: () {
                 Navigator.of(dialogContext).pop();
-                _connectionManager.acceptConnection();
+                _pendingIncomingApproval = false;
+                // Accept: navigate to chat (socket is already connected).
+                _navigateToChat();
               },
               icon: const Icon(Icons.check),
               label: const Text('Accept'),

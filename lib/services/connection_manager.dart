@@ -10,13 +10,12 @@ import 'rfcomm_channel.dart';
 
 // Explicit connection states as defined in the system design document.
 enum BtConnectionState {
-  idle,            // App started, Bluetooth available, no action in progress.
-  discovering,     // Device scan is actively running.
-  connecting,      // RFCOMM socket connection attempt in progress.
-  pendingRequest,  // Incoming connection received, awaiting user approval.
-  connected,       // RFCOMM socket is live, bidirectional data exchange active.
-  reconnecting,    // Connection loss detected, automatic reconnection underway.
-  disconnected,    // Connection terminated by user or all retries exhausted.
+  idle,          // App started, Bluetooth available, no action in progress.
+  discovering,   // Device scan is actively running.
+  connecting,    // RFCOMM socket connection attempt in progress.
+  connected,     // RFCOMM socket is live, bidirectional data exchange active.
+  reconnecting,  // Connection loss detected, automatic reconnection underway.
+  disconnected,  // Connection terminated by user or all retries exhausted.
 }
 
 class ConnectionManager {
@@ -35,9 +34,6 @@ class ConnectionManager {
   // Reference to the currently connected peer device. Null when disconnected.
   BluetoothDevice? connectedDevice;
 
-  // Reference to a device whose connection is pending user approval.
-  BluetoothDevice? pendingDevice;
-
   // Native RFCOMM platform channel for connection and I/O.
   final RfcommChannel rfcommChannel = RfcommChannel();
 
@@ -47,13 +43,8 @@ class ConnectionManager {
   // Maximum number of automatic reconnection retries before giving up.
   static const int maxRetries = 3;
 
-  // Callback invoked when an incoming connection request is received (server role).
-  // The receiver should show an approval dialog, then call acceptConnection()
-  // or declineConnection().
-  void Function(String name, String address)? onConnectionRequest;
-
-  // Callback invoked after the user accepts the incoming connection request.
-  VoidCallback? onConnectionAccepted;
+  // Callback invoked when an incoming connection is accepted (server role).
+  VoidCallback? onIncomingConnection;
 
   // Initializes the connection manager — starts the server socket and
   // sets up listeners for incoming connections.
@@ -64,15 +55,15 @@ class ConnectionManager {
     rfcommChannel.startServer();
 
     // Handle incoming connections from the server socket.
-    // Instead of auto-connecting, set to pendingRequest and let the UI ask for approval.
     rfcommChannel.onIncomingConnection = (address, name) {
-      debugPrint('BlueComm: Incoming connection request from $name ($address)');
-      pendingDevice = BluetoothDevice(
+      debugPrint('BlueComm: Accepted incoming connection from $name ($address)');
+      connectedDevice = BluetoothDevice(
         name: name,
         address: address,
       );
-      _setState(BtConnectionState.pendingRequest);
-      onConnectionRequest?.call(name, address);
+      reconnectAttempts = 0;
+      _setState(BtConnectionState.connected);
+      onIncomingConnection?.call();
     };
   }
 
@@ -138,24 +129,6 @@ class ConnectionManager {
     }
   }
 
-  // Called by the UI when the user accepts an incoming connection request.
-  void acceptConnection() {
-    if (_state == BtConnectionState.pendingRequest && pendingDevice != null) {
-      connectedDevice = pendingDevice;
-      pendingDevice = null;
-      reconnectAttempts = 0;
-      _setState(BtConnectionState.connected);
-      onConnectionAccepted?.call();
-    }
-  }
-
-  // Called by the UI when the user declines an incoming connection request.
-  void declineConnection() {
-    pendingDevice = null;
-    rfcommChannel.disconnect();
-    _setState(BtConnectionState.idle);
-  }
-
   // Cleanly terminates the active connection and releases all resources.
   void disconnect() {
     rfcommChannel.disconnect();
@@ -166,7 +139,6 @@ class ConnectionManager {
   // Resets all session-related fields to their default values.
   void _clearSession() {
     connectedDevice = null;
-    pendingDevice = null;
     reconnectAttempts = 0;
   }
 
