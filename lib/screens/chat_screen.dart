@@ -1,6 +1,7 @@
 // lib/screens/chat_screen.dart
 // Screen 2: Chat Screen — active for the duration of the messaging session.
-// Displays messages via StreamBuilder, handles send/receive, disconnect, and reconnection banner.
+// Displays messages via StreamBuilder, handles send/receive, disconnect with
+// confirmation, and bilateral disconnect notification.
 
 import 'dart:async';
 import 'package:flutter/material.dart';
@@ -48,6 +49,9 @@ class _ChatScreenState extends State<ChatScreen> {
   // Subscription to the messaging module's message stream.
   StreamSubscription<ChatMessage>? _messageSubscription;
 
+  // Guard to prevent multiple pop/disconnect calls.
+  bool _isDisconnecting = false;
+
   @override
   void initState() {
     super.initState();
@@ -61,6 +65,13 @@ class _ChatScreenState extends State<ChatScreen> {
       widget.connectionManager.rfcommChannel,
       onDisconnected: _onPeerDisconnected,
     );
+
+    // Handle intentional disconnect signal from the peer.
+    _messagingModule!.onRemoteDisconnect = () {
+      if (mounted && !_isDisconnecting) {
+        _handleRemoteDisconnect();
+      }
+    };
 
     // Listen for incoming messages and update the UI.
     _messageSubscription = _messagingModule!.messageStream.listen((message) {
@@ -82,7 +93,8 @@ class _ChatScreenState extends State<ChatScreen> {
         });
 
         // If fully disconnected after reconnection attempts, navigate back.
-        if (state == BtConnectionState.disconnected) {
+        if (state == BtConnectionState.disconnected && !_isDisconnecting) {
+          _isDisconnecting = true;
           _showSnackBar('Connection lost. Returning to device list.');
           Future.delayed(const Duration(seconds: 1), () {
             if (mounted) Navigator.pop(context);
@@ -92,11 +104,98 @@ class _ChatScreenState extends State<ChatScreen> {
     });
   }
 
-  // Called when the peer's socket input stream closes unexpectedly.
+  // Called when the peer's socket input stream closes unexpectedly (crash/lost).
   void _onPeerDisconnected() {
-    if (mounted) {
+    if (mounted && !_isDisconnecting) {
       // Trigger reconnection attempts via ConnectionManager.
       widget.connectionManager.attemptReconnect();
+    }
+  }
+
+  // Called when the peer sends an intentional disconnect signal.
+  void _handleRemoteDisconnect() {
+    _isDisconnecting = true;
+    _messagingModule?.dispose();
+    _messagingModule = null;
+    widget.connectionManager.disconnect();
+
+    // Show a dialog notifying the user, then navigate back.
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) {
+        return AlertDialog(
+          icon: const Icon(Icons.bluetooth_disabled, size: 36, color: Colors.redAccent),
+          title: const Text('Chat Disconnected'),
+          content: const Text(
+            'The other user has ended the chat.',
+            textAlign: TextAlign.center,
+          ),
+          actions: [
+            FilledButton(
+              onPressed: () {
+                Navigator.of(dialogContext).pop();
+                if (mounted) Navigator.pop(context);
+              },
+              child: const Text('OK'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  // Shows a confirmation dialog, then sends disconnect signal and navigates back.
+  void _showDisconnectConfirmation() {
+    showDialog(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          icon: const Icon(Icons.bluetooth_disabled, size: 36, color: Colors.orangeAccent),
+          title: const Text('End Chat?'),
+          content: const Text(
+            'This will disconnect you from the other user.',
+            textAlign: TextAlign.center,
+          ),
+          actionsAlignment: MainAxisAlignment.spaceEvenly,
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () {
+                Navigator.of(dialogContext).pop();
+                _performDisconnect();
+              },
+              style: FilledButton.styleFrom(backgroundColor: Colors.redAccent),
+              child: const Text('Disconnect'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  // Sends disconnect signal to peer, then disconnects and navigates back.
+  Future<void> _performDisconnect() async {
+    if (_isDisconnecting) return;
+    _isDisconnecting = true;
+
+    // Send disconnect signal to the peer so they know it's intentional.
+    try {
+      await _messagingModule?.sendDisconnectSignal();
+    } catch (_) {
+      // Ignore send errors — socket may already be closed.
+    }
+
+    _messagingModule?.dispose();
+    _messagingModule = null;
+    widget.connectionManager.disconnect();
+
+    if (mounted) {
+      _showSnackBar('Chat disconnected.');
+      Navigator.pop(context);
     }
   }
 
@@ -130,13 +229,6 @@ class _ChatScreenState extends State<ChatScreen> {
         );
       }
     });
-  }
-
-  // Cleanly disconnects and navigates back to the Discovery Screen.
-  void _disconnect() {
-    _messagingModule?.dispose();
-    widget.connectionManager.disconnect();
-    Navigator.pop(context);
   }
 
   // Attempts a manual reconnection to the last connected device.
@@ -181,141 +273,155 @@ class _ChatScreenState extends State<ChatScreen> {
     final deviceName =
         widget.connectionManager.connectedDevice?.name ?? 'Unknown Device';
 
-    return Scaffold(
-      appBar: AppBar(
-        // Connected device name displayed in the app bar.
-        title: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
+    return PopScope(
+      // Intercept back button to show confirmation dialog.
+      canPop: false,
+      onPopInvokedWithResult: (didPop, result) {
+        if (!didPop) {
+          _showDisconnectConfirmation();
+        }
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          // Back button — shows confirmation dialog.
+          leading: IconButton(
+            icon: const Icon(Icons.arrow_back),
+            onPressed: _showDisconnectConfirmation,
+          ),
+          // Connected device name displayed in the app bar.
+          title: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(deviceName, style: const TextStyle(fontSize: 16)),
+              Text(
+                _connectionState == BtConnectionState.connected
+                    ? 'Connected'
+                    : _connectionState.name,
+                style: TextStyle(
+                  fontSize: 12,
+                  color: _connectionState == BtConnectionState.connected
+                      ? Colors.greenAccent
+                      : Colors.orangeAccent,
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            // Disconnect button in the app bar — shows confirmation dialog.
+            IconButton(
+              icon: const Icon(Icons.bluetooth_disabled),
+              tooltip: 'Disconnect',
+              onPressed: _showDisconnectConfirmation,
+            ),
+          ],
+        ),
+        body: Column(
           children: [
-            Text(deviceName, style: const TextStyle(fontSize: 16)),
-            Text(
-              _connectionState == BtConnectionState.connected
-                  ? 'Connected'
-                  : _connectionState.name,
-              style: TextStyle(
-                fontSize: 12,
-                color: _connectionState == BtConnectionState.connected
-                    ? Colors.greenAccent
-                    : Colors.orangeAccent,
+            // Reconnection banner — shown when connectionState == reconnecting.
+            if (_connectionState == BtConnectionState.reconnecting)
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                color: Colors.amber.withOpacity(0.2),
+                child: Row(
+                  children: [
+                    const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Text(
+                        'Connection lost. Reconnecting... '
+                        '(Attempt ${widget.connectionManager.reconnectAttempts}/${ConnectionManager.maxRetries})',
+                        style: const TextStyle(fontSize: 13),
+                      ),
+                    ),
+                    TextButton(
+                      onPressed: _manualReconnect,
+                      child: const Text('Retry'),
+                    ),
+                  ],
+                ),
+              ),
+
+            // Message list — main content area.
+            Expanded(
+              child: _messages.isEmpty
+                  ? const Center(
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(Icons.chat_bubble_outline,
+                              size: 64, color: Colors.grey),
+                          SizedBox(height: 16),
+                          Text(
+                            'No messages yet.\nSend a message to start chatting!',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(color: Colors.grey, fontSize: 14),
+                          ),
+                        ],
+                      ),
+                    )
+                  : ListView.builder(
+                      controller: _scrollController,
+                      padding: const EdgeInsets.symmetric(vertical: 8),
+                      itemCount: _messages.length,
+                      itemBuilder: (context, index) {
+                        return MessageBubble(message: _messages[index]);
+                      },
+                    ),
+            ),
+
+            // Message input area — text field + send button.
+            Container(
+              padding: const EdgeInsets.fromLTRB(8, 8, 8, 12),
+              decoration: BoxDecoration(
+                color: Theme.of(context).scaffoldBackgroundColor,
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(0.1),
+                    blurRadius: 4,
+                    offset: const Offset(0, -2),
+                  ),
+                ],
+              ),
+              child: SafeArea(
+                child: Row(
+                  children: [
+                    // Text input field for composing messages.
+                    Expanded(
+                      child: TextField(
+                        controller: _messageController,
+                        decoration: InputDecoration(
+                          hintText: 'Type a message...',
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(24),
+                            borderSide: BorderSide.none,
+                          ),
+                          filled: true,
+                          contentPadding: const EdgeInsets.symmetric(
+                            horizontal: 16,
+                            vertical: 10,
+                          ),
+                        ),
+                        textInputAction: TextInputAction.send,
+                        onSubmitted: (_) => _sendMessage(),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    // Send button — FAB style.
+                    FloatingActionButton.small(
+                      onPressed: _sendMessage,
+                      child: const Icon(Icons.send),
+                    ),
+                  ],
+                ),
               ),
             ),
           ],
         ),
-        actions: [
-          // Disconnect button in the app bar.
-          IconButton(
-            icon: const Icon(Icons.bluetooth_disabled),
-            tooltip: 'Disconnect',
-            onPressed: _disconnect,
-          ),
-        ],
-      ),
-      body: Column(
-        children: [
-          // Reconnection banner — shown when connectionState == reconnecting.
-          if (_connectionState == BtConnectionState.reconnecting)
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-              color: Colors.amber.withOpacity(0.2),
-              child: Row(
-                children: [
-                  const SizedBox(
-                    width: 16,
-                    height: 16,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Text(
-                      'Connection lost. Reconnecting... '
-                      '(Attempt ${widget.connectionManager.reconnectAttempts}/${ConnectionManager.maxRetries})',
-                      style: const TextStyle(fontSize: 13),
-                    ),
-                  ),
-                  TextButton(
-                    onPressed: _manualReconnect,
-                    child: const Text('Retry'),
-                  ),
-                ],
-              ),
-            ),
-
-          // Message list — main content area.
-          Expanded(
-            child: _messages.isEmpty
-                ? const Center(
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Icon(Icons.chat_bubble_outline,
-                            size: 64, color: Colors.grey),
-                        SizedBox(height: 16),
-                        Text(
-                          'No messages yet.\nSend a message to start chatting!',
-                          textAlign: TextAlign.center,
-                          style: TextStyle(color: Colors.grey, fontSize: 14),
-                        ),
-                      ],
-                    ),
-                  )
-                : ListView.builder(
-                    controller: _scrollController,
-                    padding: const EdgeInsets.symmetric(vertical: 8),
-                    itemCount: _messages.length,
-                    itemBuilder: (context, index) {
-                      return MessageBubble(message: _messages[index]);
-                    },
-                  ),
-          ),
-
-          // Message input area — text field + send button.
-          Container(
-            padding: const EdgeInsets.fromLTRB(8, 8, 8, 12),
-            decoration: BoxDecoration(
-              color: Theme.of(context).scaffoldBackgroundColor,
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.black.withOpacity(0.1),
-                  blurRadius: 4,
-                  offset: const Offset(0, -2),
-                ),
-              ],
-            ),
-            child: SafeArea(
-              child: Row(
-                children: [
-                  // Text input field for composing messages.
-                  Expanded(
-                    child: TextField(
-                      controller: _messageController,
-                      decoration: InputDecoration(
-                        hintText: 'Type a message...',
-                        border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(24),
-                          borderSide: BorderSide.none,
-                        ),
-                        filled: true,
-                        contentPadding: const EdgeInsets.symmetric(
-                          horizontal: 16,
-                          vertical: 10,
-                        ),
-                      ),
-                      textInputAction: TextInputAction.send,
-                      onSubmitted: (_) => _sendMessage(),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  // Send button — FAB style.
-                  FloatingActionButton.small(
-                    onPressed: _sendMessage,
-                    child: const Icon(Icons.send),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ],
       ),
     );
   }

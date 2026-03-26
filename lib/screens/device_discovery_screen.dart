@@ -3,11 +3,15 @@
 // Handles permission requests, Bluetooth adapter checks, device scanning,
 // and navigation to the Chat Screen upon successful RFCOMM connection.
 
+import 'dart:async';
+import 'dart:typed_data';
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_bluetooth_serial/flutter_bluetooth_serial.dart';
 import '../services/permission_handler_service.dart';
 import '../services/bluetooth_manager.dart';
 import '../services/connection_manager.dart';
+import '../services/messaging_module.dart';
 import '../widgets/device_list_tile.dart';
 import 'chat_screen.dart';
 
@@ -41,8 +45,17 @@ class _DeviceDiscoveryScreenState extends State<DeviceDiscoveryScreen> {
   BtConnectionState _connectionState = BtConnectionState.idle;
 
   // True when an incoming connection is waiting for user approval via dialog.
-  // Prevents the stateStream listener from auto-navigating to chat.
   bool _pendingIncomingApproval = false;
+
+  // True when this device initiated a connection and is waiting for the
+  // receiver to accept or decline (sender side).
+  bool _waitingForRemoteApproval = false;
+
+  // Subscription to rfcomm data stream for listening to accept signal.
+  StreamSubscription? _approvalDataSubscription;
+
+  // Buffer for accumulating incoming bytes while waiting for accept signal.
+  String _approvalBuffer = '';
 
   @override
   void initState() {
@@ -67,23 +80,103 @@ class _DeviceDiscoveryScreenState extends State<DeviceDiscoveryScreen> {
       }
     };
 
-    // Listen to connection state changes for the status chip and navigation.
+    // Listen to connection state changes for the status chip.
     _connectionManager.stateStream.listen((state) {
       if (mounted) {
         setState(() {
           _connectionState = state;
         });
 
-        // Navigate to Chat Screen when connection is established (client-side only).
-        // For incoming connections, navigation is gated behind the approval dialog.
-        if (state == BtConnectionState.connected && !_pendingIncomingApproval) {
-          _navigateToChat();
+        // Client-side: when connected, start waiting for the receiver's approval.
+        if (state == BtConnectionState.connected &&
+            !_pendingIncomingApproval &&
+            !_waitingForRemoteApproval) {
+          _startWaitingForApproval();
+        }
+
+        // If disconnected while waiting for approval, the request was declined.
+        if (state == BtConnectionState.disconnected && _waitingForRemoteApproval) {
+          _stopWaitingForApproval();
+          _showDeclinedDialog();
         }
       }
     });
 
     // Request permissions on screen initialization.
     _initPermissions();
+  }
+
+  // Called on the sender side when the RFCOMM connection succeeds.
+  // Listens for the accept signal from the receiver before navigating to chat.
+  void _startWaitingForApproval() {
+    _waitingForRemoteApproval = true;
+    _approvalBuffer = '';
+    setState(() {});
+
+    _showSnackBar('Waiting for the other user to accept...');
+
+    // Listen on the rfcomm data stream directly for the accept signal.
+    _approvalDataSubscription = _connectionManager.rfcommChannel.dataStream.listen(
+      (Uint8List data) {
+        _approvalBuffer += utf8.decode(data);
+
+        // Check if we received the accept signal.
+        if (_approvalBuffer.contains(MessagingModule.acceptSignal)) {
+          _stopWaitingForApproval();
+          _navigateToChat();
+        }
+        // Check if we received a disconnect signal (decline).
+        if (_approvalBuffer.contains(MessagingModule.disconnectSignal)) {
+          _stopWaitingForApproval();
+          _connectionManager.disconnect();
+          _showDeclinedDialog();
+        }
+      },
+      onError: (_) {
+        _stopWaitingForApproval();
+        _showDeclinedDialog();
+      },
+      onDone: () {
+        if (_waitingForRemoteApproval) {
+          _stopWaitingForApproval();
+          _showDeclinedDialog();
+        }
+      },
+    );
+  }
+
+  // Cancels the approval wait and cleans up resources.
+  void _stopWaitingForApproval() {
+    _waitingForRemoteApproval = false;
+    _approvalBuffer = '';
+    _approvalDataSubscription?.cancel();
+    _approvalDataSubscription = null;
+    if (mounted) setState(() {});
+  }
+
+  // Shows a dialog when the receiver declines the connection request.
+  void _showDeclinedDialog() {
+    if (!mounted) return;
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) {
+        return AlertDialog(
+          icon: const Icon(Icons.bluetooth_disabled, size: 36, color: Colors.redAccent),
+          title: const Text('Request Declined'),
+          content: const Text(
+            'The other user declined your connection request.',
+            textAlign: TextAlign.center,
+          ),
+          actions: [
+            FilledButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('OK'),
+            ),
+          ],
+        );
+      },
+    );
   }
 
   // Requests Bluetooth and location permissions on app start.
@@ -214,6 +307,7 @@ class _DeviceDiscoveryScreenState extends State<DeviceDiscoveryScreen> {
       // When returning from Chat Screen, reload paired devices and reset flags.
       if (mounted) {
         _pendingIncomingApproval = false;
+        _waitingForRemoteApproval = false;
         _loadPairedDevices();
         setState(() {
           _connectionState = _connectionManager.currentState;
@@ -253,6 +347,7 @@ class _DeviceDiscoveryScreenState extends State<DeviceDiscoveryScreen> {
 
   // Returns a human-readable label for the connection status chip.
   String _getStatusLabel() {
+    if (_waitingForRemoteApproval) return 'Waiting...';
     switch (_connectionState) {
       case BtConnectionState.idle:
         return 'Idle';
@@ -304,10 +399,17 @@ class _DeviceDiscoveryScreenState extends State<DeviceDiscoveryScreen> {
           actionsAlignment: MainAxisAlignment.spaceEvenly,
           actions: [
             TextButton.icon(
-              onPressed: () {
+              onPressed: () async {
                 Navigator.of(dialogContext).pop();
                 _pendingIncomingApproval = false;
-                // Decline: disconnect the already-accepted socket.
+                // Decline: send disconnect signal so the sender gets notified
+                // immediately, then close the socket.
+                final bytes = Uint8List.fromList(
+                  utf8.encode('${MessagingModule.disconnectSignal}\n'),
+                );
+                await _connectionManager.rfcommChannel.send(bytes);
+                // Small delay to let the signal reach the sender before socket closes.
+                await Future.delayed(const Duration(milliseconds: 300));
                 _connectionManager.disconnect();
                 _showSnackBar('Connection declined.');
               },
@@ -318,10 +420,14 @@ class _DeviceDiscoveryScreenState extends State<DeviceDiscoveryScreen> {
               ),
             ),
             FilledButton.icon(
-              onPressed: () {
+              onPressed: () async {
                 Navigator.of(dialogContext).pop();
                 _pendingIncomingApproval = false;
-                // Accept: navigate to chat (socket is already connected).
+                // Accept: send accept signal to the sender, then navigate to chat.
+                final bytes = Uint8List.fromList(
+                  utf8.encode('${MessagingModule.acceptSignal}\n'),
+                );
+                await _connectionManager.rfcommChannel.send(bytes);
                 _navigateToChat();
               },
               icon: const Icon(Icons.check),
@@ -340,6 +446,7 @@ class _DeviceDiscoveryScreenState extends State<DeviceDiscoveryScreen> {
   void dispose() {
     _nameController.dispose();
     _bluetoothManager.dispose();
+    _approvalDataSubscription?.cancel();
     super.dispose();
   }
 
@@ -355,7 +462,9 @@ class _DeviceDiscoveryScreenState extends State<DeviceDiscoveryScreen> {
             padding: const EdgeInsets.only(right: 12),
             child: Chip(
               avatar: CircleAvatar(
-                backgroundColor: _getStatusColor(),
+                backgroundColor: _waitingForRemoteApproval
+                    ? Colors.orange
+                    : _getStatusColor(),
                 radius: 6,
               ),
               label: Text(
@@ -393,7 +502,9 @@ class _DeviceDiscoveryScreenState extends State<DeviceDiscoveryScreen> {
             child: SizedBox(
               width: double.infinity,
               child: ElevatedButton.icon(
-                onPressed: _isScanning ? null : _startScan,
+                onPressed: _isScanning || _waitingForRemoteApproval
+                    ? null
+                    : _startScan,
                 icon: _isScanning
                     ? const SizedBox(
                         width: 18,
@@ -411,6 +522,7 @@ class _DeviceDiscoveryScreenState extends State<DeviceDiscoveryScreen> {
               ),
             ),
           ),
+
 
           // Device lists — scrollable.
           Expanded(

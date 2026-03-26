@@ -51,6 +51,10 @@ class ConnectionManager {
   void initialize() {
     rfcommChannel.initialize();
 
+    // Clear any stale connection from a previous session / hot restart
+    // before starting the server socket.
+    rfcommChannel.disconnect();
+
     // Start the server socket so this device can accept incoming connections.
     rfcommChannel.startServer();
 

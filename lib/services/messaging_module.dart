@@ -11,6 +11,12 @@ import '../models/chat_message.dart';
 import 'rfcomm_channel.dart';
 
 class MessagingModule {
+  // Special signal sent over the socket to notify the peer of an intentional disconnect.
+  static const String disconnectSignal = '__BLUECOMM_DISCONNECT__';
+
+  // Special signal sent by the receiver to approve the connection request.
+  static const String acceptSignal = '__BLUECOMM_ACCEPT__';
+
   // Reference to the native RFCOMM platform channel for send/receive.
   final RfcommChannel rfcommChannel;
 
@@ -29,8 +35,11 @@ class MessagingModule {
   // Buffer for accumulating incoming bytes until a complete message (newline) is found.
   String _buffer = '';
 
-  // Callback invoked when the socket stream closes (peer disconnected).
+  // Callback invoked when the socket stream closes unexpectedly (peer crashed/lost).
   final VoidCallback? onDisconnected;
+
+  // Callback invoked when the peer sends an intentional disconnect signal.
+  VoidCallback? onRemoteDisconnect;
 
   // Initializes the module by subscribing to the native data stream.
   MessagingModule(this.rfcommChannel, {this.onDisconnected}) {
@@ -61,6 +70,17 @@ class MessagingModule {
 
       // Only process non-empty messages.
       if (messageText.isNotEmpty) {
+        // Intercept control signals — don't treat them as chat messages.
+        if (messageText == disconnectSignal) {
+          debugPrint('BlueComm: Received disconnect signal from peer');
+          onRemoteDisconnect?.call();
+          return;
+        }
+        if (messageText == acceptSignal) {
+          // Accept signal is handled by the discovery screen, ignore here.
+          return;
+        }
+
         final message = ChatMessage(
           messageText: messageText,
           isSentByUser: false,
@@ -71,6 +91,14 @@ class MessagingModule {
         }
       }
     }
+  }
+
+  // Sends the disconnect signal to the peer before closing the socket.
+  Future<void> sendDisconnectSignal() async {
+    final bytes = Uint8List.fromList(utf8.encode('$disconnectSignal\n'));
+    await rfcommChannel.send(bytes);
+    // Small delay to let the signal reach the peer before socket closes.
+    await Future.delayed(const Duration(milliseconds: 200));
   }
 
   // Encodes and sends a text message over the RFCOMM socket via the native channel.
