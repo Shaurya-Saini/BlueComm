@@ -14,6 +14,9 @@ class MessagingModule {
   // Special signal sent over the socket to notify the peer of an intentional disconnect.
   static const String disconnectSignal = '__BLUECOMM_DISCONNECT__';
 
+  // Special signal sent by the receiver to approve the connection request.
+  static const String acceptSignal = '__BLUECOMM_ACCEPT__';
+
   // Reference to the native RFCOMM platform channel for send/receive.
   final RfcommChannel rfcommChannel;
 
@@ -67,10 +70,14 @@ class MessagingModule {
 
       // Only process non-empty messages.
       if (messageText.isNotEmpty) {
-        // Intercept the disconnect signal — don't treat it as a chat message.
+        // Intercept control signals — don't treat them as chat messages.
         if (messageText == disconnectSignal) {
           debugPrint('BlueComm: Received disconnect signal from peer');
           onRemoteDisconnect?.call();
+          return;
+        }
+        if (messageText == acceptSignal) {
+          // Accept signal is handled by the discovery screen, ignore here.
           return;
         }
 
